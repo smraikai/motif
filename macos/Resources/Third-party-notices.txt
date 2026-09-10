@@ -1,0 +1,17 @@
+Motif for macOS
+Based on https://github.com/itsdotdev/omarchy-youtube-music (MIT).
+The original license is included in this bundle as LICENSE.
+
+yt-dlp 2026.08.19
+https://github.com/yt-dlp/yt-dlp
+The official macOS release includes Python and third-party packages.
+The bundled release is distributed under GPLv3+; its source, licenses, and
+third-party license inventory are available in the matching release:
+https://github.com/yt-dlp/yt-dlp/tree/2026.08.19
+https://github.com/yt-dlp/yt-dlp/blob/2026.08.19/THIRD_PARTY_LICENSES.txt
+
+Deno 2.9.6
+https://github.com/denoland/deno/tree/v2.9.6
+MIT licensed, with third-party components identified in that source release.
+
+This app is not affiliated with YouTube or Google.

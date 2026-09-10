@@ -1,0 +1,6 @@
+macos/.build/
+macos/.deps/
+macos/dist/
+.DS_Store
+
+/work/
