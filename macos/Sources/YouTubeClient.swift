@@ -79,18 +79,27 @@ protocol MusicClient {
 final class YouTubeClient: MusicClient {
     let tools: URL
     let cacheDirectory: URL
-    init(tools: URL = Bundle.main.resourceURL!.appendingPathComponent("Tools"), cacheDirectory: URL? = nil) {
+    private let fastResolver: FastStreamResolver?
+    var streamEvent: ((String, String) -> Void)?
+    var extractor: URL {
+        let unpacked = tools.appendingPathComponent("yt-dlp-runtime/yt-dlp_macos")
+        return FileManager.default.isExecutableFile(atPath: unpacked.path) ? unpacked : tools.appendingPathComponent("yt-dlp")
+    }
+    init(tools: URL = Bundle.main.resourceURL!.appendingPathComponent("Tools"), cacheDirectory: URL? = nil, enableFastResolver: Bool = true, fastResolver: FastStreamResolver? = nil) {
+        self.fastResolver = enableFastResolver ? (fastResolver ?? FastStreamResolver()) : nil
+        self.fastResolver?.prepare()
         self.tools = tools
         self.cacheDirectory = cacheDirectory ?? FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("io.github.itsdotdev.motif/yt-dlp", isDirectory: true)
     }
     var available: Bool {
-        ["yt-dlp", "deno"].allSatisfy { FileManager.default.isExecutableFile(atPath: tools.appendingPathComponent($0).path) }
+        FileManager.default.isExecutableFile(atPath: extractor.path) &&
+            FileManager.default.isExecutableFile(atPath: tools.appendingPathComponent("deno").path)
     }
     @discardableResult
     func request(_ arguments: [String], completion: @escaping (Result<Data, Error>) -> Void) -> Extraction {
         let request = Extraction()
-        request.run(executable: tools.appendingPathComponent("yt-dlp"), arguments: [
+        request.run(executable: extractor, arguments: [
             "--ignore-config", "--no-plugin-dirs", "--cache-dir", cacheDirectory.path, "--no-warnings",
             "--socket-timeout", "15", "--retries", "1", "--extractor-retries", "1",
             "--js-runtimes", "deno:\(tools.appendingPathComponent("deno").path)"
@@ -109,8 +118,39 @@ final class YouTubeClient: MusicClient {
         }
     }
     func stream(_ track: Track, completion: @escaping (Result<URL, Error>) -> Void) -> Extraction {
-        request(["--no-playlist", "--skip-download", "--dump-single-json", "--format",
-                 "bestaudio[ext=m4a]/bestaudio[protocol*=m3u8]/best[ext=mp4]", track.url.absoluteString]) {
+        guard let fastResolver, !track.isLive else { return fallbackStream(track, completion: completion) }
+        var task: Task<Void, Never>?
+        var fallback: Extraction?
+        let token = Extraction {
+            task?.cancel()
+            DispatchQueue.main.async { fallback?.cancel() }
+        }
+        streamEvent?(track.id, "native-start")
+        task = Task { @MainActor [weak self] in
+            defer { task = nil }
+            do {
+                let url = try await fastResolver.stream(track)
+                if !token.isCancelled {
+                    self?.streamEvent?(track.id, "native-ready")
+                    completion(.success(url))
+                }
+            } catch {
+                guard !token.isCancelled, let self else { return }
+                let detail = error is PlayerError ? error.localizedDescription : "\((error as NSError).domain):\((error as NSError).code)"
+                self.streamEvent?(track.id, "native-failed: " + detail)
+                fallback = self.fallbackStream(track) { result in
+                    if !token.isCancelled { completion(result) }
+                }
+            }
+        }
+        return token
+    }
+    private func fallbackStream(_ track: Track, completion: @escaping (Result<URL, Error>) -> Void) -> Extraction {
+        streamEvent?(track.id, "extractor-start")
+        // Prefer segmented audio. Some direct fragmented M4A streams never
+        // become ready in AVPlayer, despite returning valid HTTP byte ranges.
+        return request(["--no-playlist", "--skip-download", "--dump-single-json", "--format",
+                 "bestaudio[protocol*=m3u8]/bestaudio[ext=m4a]/best[ext=mp4]", track.url.absoluteString]) {
             completion($0.flatMap { data in Result {
                 let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
                 guard let raw = object?["url"] as? String, let url = URL(string: raw), url.scheme == "https" else {

@@ -30,12 +30,14 @@ final class ResolverClient: MusicClient {
         var deliveries = 0
         var openedAudio: PreparedAudio?
         resolver.prepare([a, b, c])
-        precondition(client.requests.count == 1 && client.requests[0].track == a, "Warm one track at a time")
+        precondition(client.requests.count == 2 && client.requests[0].track == a && client.requests[1].track == b,
+                     "Prepare the two likely choices together, without extracting the whole result list")
         let click = resolver.resolve(a) { result in
             precondition((try? result.get().url) == url); deliveries += 1
             openedAudio = try? result.get().audio
         }
-        precondition(client.requests.count == 1, "Clicking a warming track must reuse its extractor")
+        precondition(client.requests.count == 2, "Clicking a warming track must reuse its extractor")
+        precondition(client.requests[1].token.isCancelled, "Playback must take priority over unrelated preparation")
         resolver.prepare([])
         precondition(!client.requests[0].token.isCancelled, "Cancelling warm-up must preserve the click's subscription")
         client.requests[0].complete(.success(url))
@@ -46,23 +48,24 @@ final class ResolverClient: MusicClient {
             precondition((try? $0.get().audio) === openedAudio, "Reuse the prepared media asset, not just its URL")
         }
         tick()
-        precondition(reused && client.requests.count == 1, "A ready track must skip extraction entirely")
+        precondition(reused && client.requests.count == 2, "A ready track must skip extraction entirely")
         let cancelledHit = resolver.resolve(a) { _ in fatalError("A cancelled cache hit was delivered") }
         cancelledHit.cancel(); tick()
         click.cancel()
 
         date = date.addingTimeInterval(541)
         _ = resolver.resolve(a) { _ in }
-        precondition(client.requests.count == 2, "Refresh before the signed URL expires")
+        precondition(client.requests.count == 3, "Refresh before the signed URL expires")
         resolver.shutdown()
-        client.requests[1].complete(.success(url))
+        client.requests[2].complete(.success(url))
 
         let secondClient = ResolverClient()
         let second = StreamResolver(client: secondClient, preloadAssets: false)
         second.prepare([a, b, c])
-        secondClient.requests[0].complete(.success(URL(string: "https://audio.invalid/a")!))
         precondition(secondClient.requests.count == 2 && secondClient.requests[1].track == b)
+        // The second result can finish first; neither selection waits for the other.
         secondClient.requests[1].complete(.success(URL(string: "https://audio.invalid/b")!))
+        secondClient.requests[0].complete(.success(URL(string: "https://audio.invalid/a")!))
         precondition(secondClient.requests.count == 2, "Don't resolve an entire search result list")
         second.invalidate(a)
         _ = second.resolve(a) { _ in }

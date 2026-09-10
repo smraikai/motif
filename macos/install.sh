@@ -13,8 +13,24 @@ if [[ -e "$installed_app" ]]; then
   identifier=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$installed_app/Contents/Info.plist")
   [[ "$identifier" == "io.github.itsdotdev.motif" ]] || { printf 'A different app already exists at %s.\n' "$installed_app" >&2; exit 1; }
 fi
+staging_dir="$(mktemp -d "/Applications/.motif-install.XXXXXX")"
+cleanup() {
+  result=$?
+  if [[ $result -ne 0 && -e "$staging_dir/previous.app" ]]; then
+    rm -rf "$installed_app"
+    mv "$staging_dir/previous.app" "$installed_app"
+  fi
+  rm -rf "$staging_dir"
+  exit "$result"
+}
+trap cleanup EXIT
+ditto --noextattr --norsrc "$source_app" "$staging_dir/Motif.app"
+codesign --verify --deep --strict "$staging_dir/Motif.app"
 xcrun swift -module-cache-path .build/ModuleCache Tools/StopPlayer.swift
-ditto --noextattr --norsrc "$source_app" "$installed_app"
+if [[ -e "$installed_app" ]]; then
+  mv "$installed_app" "$staging_dir/previous.app"
+fi
+mv "$staging_dir/Motif.app" "$installed_app"
 codesign --verify --deep --strict "$installed_app"
 if [[ "${1:-}" == "--open-at-login" ]]; then
   open "$installed_app" --args --enable-login-item

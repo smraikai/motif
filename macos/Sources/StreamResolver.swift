@@ -25,20 +25,28 @@ final class StreamResolver {
     private var cache: [String: Entry] = [:]
     private var pending: [String: Pending] = [:]
     private var candidates: [Track] = []
-    private var warming: (id: String, token: Extraction)?
+    private var warming: [String: Extraction] = [:]
     init(client: MusicClient, preloadAssets: Bool = true, now: @escaping () -> Date = Date.init) {
         self.client = client; self.preloadAssets = preloadAssets; self.now = now
     }
 
     func resolve(_ track: Track, completion: @escaping (Result<Stream, Error>) -> Void) -> Extraction {
         candidates = []
-        if warming?.id != track.id { stopWarmup() }
+        cache.filter { $0.key != track.id }.values.forEach { $0.audio.discardPreroll() }
+        stopWarmup(except: [track.id])
         return request(track, completion: completion)
     }
     func prepare(_ tracks: [Track]) {
         var seen = Set<String>()
         candidates = Array(tracks.filter { !$0.isLive && seen.insert($0.id).inserted }.prefix(2))
-        if let warming, !candidates.contains(where: { $0.id == warming.id }) { stopWarmup() }
+        let wanted = Set(candidates.map(\.id))
+        // Retain at most two paused playback pipelines, plus the active player.
+        // Other cached entries keep only their URL and media asset.
+        for (id, entry) in cache {
+            if wanted.contains(id), entry.expires > now(), preloadAssets { entry.audio.preparePlayback() }
+            else { entry.audio.discardPreroll() }
+        }
+        stopWarmup(except: wanted)
         warmNext()
     }
     func invalidate(_ track: Track) { cache.removeValue(forKey: track.id) }
@@ -77,7 +85,7 @@ final class StreamResolver {
             guard let self, let request, self.pending[track.id]?.id == request.id else { return }
             self.pending.removeValue(forKey: track.id)
             let response = result.map { url -> Stream in
-                let audio = PreparedAudio(url: url, preload: self.preloadAssets && !track.isLive && self.warming?.id == track.id)
+                let audio = PreparedAudio(url: url, preload: self.preloadAssets && !track.isLive && self.warming[track.id] != nil)
                 if !track.isLive { self.remember(url, audio: audio, for: track.id) }
                 return Stream(url: url, reused: false, audio: audio)
             }
@@ -104,22 +112,21 @@ final class StreamResolver {
             request.job?.cancel()
         }
     }
-    private func stopWarmup() {
-        let token = warming?.token
-        warming = nil
-        token?.cancel()
+    private func stopWarmup(except keep: Set<String> = []) {
+        for id in Array(warming.keys) where !keep.contains(id) {
+            warming.removeValue(forKey: id)?.cancel()
+        }
     }
     private func warmNext() {
-        guard warming == nil else { return }
-        while let candidate = candidates.first {
+        while warming.count < 2, let candidate = candidates.first {
             candidates.removeFirst()
+            if warming[candidate.id] != nil { continue }
             if let entry = cache[candidate.id], entry.expires > now() { continue }
             let token = request(candidate) { [weak self] _ in
-                guard let self, self.warming?.id == candidate.id else { return }
-                self.warming = nil; self.warmNext()
+                guard let self, self.warming[candidate.id] != nil else { return }
+                self.warming.removeValue(forKey: candidate.id); self.warmNext()
             }
-            warming = (candidate.id, token)
-            break
+            warming[candidate.id] = token
         }
     }
 }

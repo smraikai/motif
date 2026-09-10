@@ -1,10 +1,11 @@
 import AppKit
 import AVFoundation
+import class AVFoundation.AVPlayerItem
 import MediaPlayer
 
 final class PlayerStore {
     let client: MusicClient
-    let player = AVPlayer()
+    private(set) var player = AVPlayer()
     private let resolver: StreamResolver
     private let enablePreloading: Bool
     var changed: (() -> Void)?
@@ -52,19 +53,27 @@ final class PlayerStore {
         }
         if defaults.object(forKey: "volume") != nil { volume = defaults.float(forKey: "volume") }
         player.volume = volume
-        timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main) { [weak self] time in
-            guard let self else { return }
+        observePlayer()
+        if enableMediaControls { installRemoteCommands() }
+        if !client.available { message = "The bundled player tools are missing. Rebuild or reinstall the app." }
+        if enablePreloading, let current { resolver.prepare([current]) }
+    }
+
+    private func observePlayer() {
+        let observed = player
+        timeObserver = observed.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main) { [weak self, weak observed] time in
+            guard let self, self.player === observed else { return }
             self.position = time.seconds.isFinite ? max(0, time.seconds) : 0
             let seconds = self.player.currentItem?.duration.seconds ?? 0
             self.duration = seconds.isFinite ? max(0, seconds) : 0
             if self.position > 10 { self.failures = 0 }
             self.notify()
         }
-        rateObserver = player.observe(\.timeControlStatus, options: [.new]) { [weak self] _, _ in
+        rateObserver = observed.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self, weak observed] _, _ in
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self, self.player === observed else { return }
                 self.playing = self.player.timeControlStatus == .playing
-                self.loading = self.wantsPlayback && (self.streamJob != nil || self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate)
+                self.loading = self.wantsPlayback && !self.playing
                 if self.playing {
                     self.retryCachedStream = false; self.startupBufferObserver = nil
                     self.startPendingMix()
@@ -73,9 +82,10 @@ final class PlayerStore {
                 self.notify()
             }
         }
-        if enableMediaControls { installRemoteCommands() }
-        if !client.available { message = "The bundled player tools are missing. Rebuild or reinstall the app." }
-        if enablePreloading, let current { resolver.prepare([current]) }
+    }
+    private func stopObservingPlayer() {
+        rateObserver = nil
+        if let timeObserver { player.removeTimeObserver(timeObserver); self.timeObserver = nil }
     }
 
     func notify() {
@@ -181,14 +191,17 @@ final class PlayerStore {
         }
     }
     func prepareForSelection(_ track: Track) {
-        if enablePreloading && !loading && current?.id != track.id { resolver.prepare([track]) }
+        guard enablePreloading, !loading, current?.id != track.id else { return }
+        let other = displayedTracks.first { $0.id != track.id && $0.id != current?.id }
+        resolver.prepare([track] + (other.map { [$0] } ?? []))
     }
     private func prepareNextTrack() {
         guard enablePreloading, !showingSearch, !loading,
               queue.tracks.indices.contains(queue.index + 1) else { return }
-        resolver.prepare([queue.tracks[queue.index + 1]])
+        resolver.prepare(Array(queue.tracks.dropFirst(queue.index + 1).prefix(2)))
     }
     private func clearItem() {
+        stopObservingPlayer()
         statusObserver = nil
         startupBufferObserver = nil
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
@@ -197,11 +210,13 @@ final class PlayerStore {
         player.pause(); player.replaceCurrentItem(with: nil)
     }
     private func load(_ audio: PreparedAudio, id: UUID) {
-        // Duration is already available in the search result. Do not delay the
-        // first audio frame to load it again before marking the item ready.
-        let item = AVPlayerItem(asset: audio.claim(), automaticallyLoadedAssetKeys: [])
-        item.preferredForwardBufferDuration = 2
-        statusObserver = item.observe(\.status, options: [.new]) { [weak self] item, _ in
+        // Adopt the entire prepared pipeline. Moving an asset into a new player
+        // throws away the decoder/buffer work done before selection.
+        player = audio.takePlayer()
+        player.volume = volume
+        observePlayer()
+        guard let item = player.currentItem else { failed(id: id); return }
+        statusObserver = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
             DispatchQueue.main.async {
                 guard let self, self.streamID == id else { return }
                 if item.status == .failed { self.failed(id: id) }
@@ -212,7 +227,7 @@ final class PlayerStore {
                 }
             }
         }
-        startupBufferObserver = item.observe(\.isPlaybackBufferEmpty, options: [.new]) { [weak self] item, _ in
+        startupBufferObserver = item.observe(\.isPlaybackBufferEmpty, options: [.initial, .new]) { [weak self] item, _ in
             DispatchQueue.main.async { self?.startAvailableAudio(item, id: id) }
         }
         endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
@@ -223,8 +238,7 @@ final class PlayerStore {
         failureObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemFailedToPlayToEndTime, object: item, queue: .main) { [weak self] _ in
             self?.failed(id: id)
         }
-        player.replaceCurrentItem(with: item)
-        if wantsPlayback { player.play() }
+        if wantsPlayback { player.play(); startAvailableAudio(item, id: id) }
         // A ready stream that never starts must not leave the UI loading forever.
         DispatchQueue.main.asyncAfter(deadline: .now() + 40) { [weak self] in
             guard let self, self.streamID == id, self.wantsPlayback,

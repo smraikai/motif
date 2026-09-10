@@ -12,7 +12,8 @@ xcrun swiftc -swift-version 5 -O -target "$(uname -m)-apple-macosx13.0" \
   -o "$app/Contents/MacOS/Motif"
 cp Resources/Info.plist "$app/Contents/Info.plist"
 cp Resources/MenuBarIcon.png "$app/Contents/Resources/"
-cp .deps/yt-dlp .deps/deno "$app/Contents/Resources/Tools/"
+cp .deps/deno "$app/Contents/Resources/Tools/"
+ditto --noextattr --norsrc .deps/yt-dlp-runtime "$app/Contents/Resources/Tools/yt-dlp-runtime"
 cp ../LICENSE "$app/Contents/Resources/LICENSE"
 cp Resources/Third-party-notices.txt "$app/Contents/Resources/"
 cp -R Resources/Licenses "$app/Contents/Resources/"
@@ -23,5 +24,9 @@ xattr -dr com.apple.FinderInfo "$app" 2>/dev/null || true
 xattr -dr com.apple.ResourceFork "$app" 2>/dev/null || true
 codesign --force --sign - "$app"
 codesign --verify --deep --strict "$app"
+# ditto merges directories. Retaining files from an earlier release breaks the
+# resource seal when the bundled extractor changes its directory layout.
+rm -rf "$PWD/dist/Motif.app"
 ditto --noextattr --norsrc "$app" "$PWD/dist/Motif.app"
+codesign --verify --deep --strict "$PWD/dist/Motif.app"
 printf 'Built %s\n' "$PWD/dist/Motif.app"
